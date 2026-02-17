@@ -1,0 +1,51 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "{{PROVIDER}}/{{MODEL}}",
+  "small_model": "{{PROVIDER}}/{{SMALL_MODEL}}",
+  "default_agent": "nyx",
+  "agent": {
+    "nyx": {
+      "mode": "primary",
+      "description": "Agentic penetration tester and OSINT machine on Kali Linux",
+      "model": "{{PROVIDER}}/{{MODEL}}"
+    }
+  },
+  "provider": {
+    "{{PROVIDER}}": {
+      "options": {
+        "apiKey": "{env:{{API_KEY_ENV_VAR}}}"
+      }
+    }
+  },
+  "instructions": [{{INSTRUCTIONS}}],
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "webfetch": "allow",
+    "websearch": "allow",
+    "external_directory": {
+      "*": "ask",
+      "{{WORKSPACE}}/*": "allow",
+      "/usr/share/*": "allow"
+    }
+  },
+  "mcp": {
+    "nyx-memory": {
+      "type": "local",
+      "command": ["nyx-memory", "serve"],
+      "enabled": true,
+      "environment": {
+        "NYX_DATA_DIR": "{{WORKSPACE}}/engagements"
+      }
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "reserved": 10000
+  },
+  "autoupdate": false,
+  "watcher": {
+    "ignore": ["engagements/**", ".env"]
+  }
+}

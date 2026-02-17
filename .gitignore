@@ -1,0 +1,15 @@
+# Nyx
+.env
+*.qcow2
+*.7z
+engagements/
+.cache/
+
+# Dev
+.claude
+.venv
+references
+output
+preparation
+__pycache__/
+*.pyc
