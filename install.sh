@@ -371,29 +371,24 @@ wait_for_virsh() {
     return 1
 }
 
-ensure_default_network() {
-    local xml_candidate tmp_xml
+cleanup_stale_network() {
+    sudo virsh net-destroy default >/dev/null 2>&1 || true
 
-    # In modular mode, virtnetworkd must be running to manage networks.
-    # In monolithic mode libvirtd handles everything — don't start
-    # modular daemons or they'll conflict.
-    if $USE_MODULAR_DAEMONS; then
-        sudo systemctl start virtnetworkd.socket  >/dev/null 2>&1 || true
-        sudo systemctl start virtnetworkd.service >/dev/null 2>&1 || true
-    fi
+    local pidfile
+    for pidfile in /run/libvirt/network/default.pid /var/run/libvirt/network/default.pid; do
+        if [[ -f "$pidfile" ]]; then
+            sudo kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+            sudo rm -f "$pidfile"
+        fi
+    done
 
-    # Define default network from packaged XML when available.
-    if ! sudo virsh net-info default >/dev/null 2>&1; then
-        for xml_candidate in /usr/share/libvirt/networks/default.xml /etc/libvirt/qemu/networks/default.xml; do
-            [[ -f "$xml_candidate" ]] || continue
-            sudo virsh net-define "$xml_candidate" >/dev/null 2>&1 && break
-        done
-    fi
+    sudo ip link delete virbr0 2>/dev/null || true
+}
 
-    # Last resort: define a standard libvirt NAT network.
-    if ! sudo virsh net-info default >/dev/null 2>&1; then
-        tmp_xml="$(mktemp /tmp/nyx-default-net.XXXXXX.xml)"
-        cat >"$tmp_xml" <<'EOF'
+define_default_network_xml() {
+    local tmp_xml
+    tmp_xml="$(mktemp /tmp/nyx-default-net.XXXXXX.xml)"
+    cat >"$tmp_xml" <<'EOF'
 <network>
   <name>default</name>
   <forward mode='nat'/>
@@ -405,13 +400,49 @@ ensure_default_network() {
   </ip>
 </network>
 EOF
-        sudo virsh net-define "$tmp_xml" >/dev/null 2>&1 || true
-        rm -f "$tmp_xml"
+    sudo virsh net-define "$tmp_xml" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$tmp_xml"
+    return $rc
+}
+
+ensure_default_network() {
+    local err_out
+
+    if $USE_MODULAR_DAEMONS; then
+        sudo systemctl start virtnetworkd.socket  >/dev/null 2>&1 || true
+        sudo systemctl start virtnetworkd.service >/dev/null 2>&1 || true
     fi
 
-    sudo virsh net-start default >/dev/null 2>&1 || true
+    # Attempt 1: just start it (may already be defined but inactive)
+    if sudo virsh net-start default >/dev/null 2>&1; then
+        sudo virsh net-autostart default >/dev/null 2>&1 || true
+        default_network_active && return 0
+    fi
+
+    # Attempt 2: cleanup stale state, ensure defined, start
+    cleanup_stale_network
+    if ! sudo virsh net-info default >/dev/null 2>&1; then
+        define_default_network_xml || true
+    fi
+    err_out=$(sudo virsh net-start default 2>&1) || true
     sudo virsh net-autostart default >/dev/null 2>&1 || true
-    default_network_active
+    default_network_active && return 0
+
+    # Attempt 3: nuclear — undefine everything, redefine, start
+    sudo virsh net-destroy default  >/dev/null 2>&1 || true
+    sudo virsh net-undefine default >/dev/null 2>&1 || true
+    cleanup_stale_network
+    define_default_network_xml || true
+    err_out=$(sudo virsh net-start default 2>&1) || true
+    sudo virsh net-autostart default >/dev/null 2>&1 || true
+
+    if default_network_active; then
+        return 0
+    fi
+
+    [[ -n "$err_out" ]] && warn "virsh net-start default: $err_out"
+    return 1
 }
 
 setup_services() {

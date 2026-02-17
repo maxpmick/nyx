@@ -70,29 +70,30 @@ default_network_active() {
         || sudo virsh net-info default 2>/dev/null | grep -q "Active:.*yes"
 }
 
-ensure_default_network() {
-    local xml_candidate tmp_xml
+_cleanup_stale_network() {
+    # When libvirtd restarts, the default network can end up in a
+    # split-brain state: virsh thinks it's inactive but dnsmasq and
+    # virbr0 are still alive from the previous daemon.  Clean it all up.
+    sudo virsh net-destroy default >/dev/null 2>&1 || true
 
-    # In modular mode, virtnetworkd must be running.
-    # In monolithic mode libvirtd handles everything — don't start
-    # modular daemons or they'll conflict.
-    if $_NYX_USE_MODULAR; then
-        sudo systemctl start virtnetworkd.socket  >/dev/null 2>&1 || true
-        sudo systemctl start virtnetworkd.service >/dev/null 2>&1 || true
-    fi
+    # Kill orphaned dnsmasq via its PID file
+    local pidfile
+    for pidfile in /run/libvirt/network/default.pid /var/run/libvirt/network/default.pid; do
+        if [[ -f "$pidfile" ]]; then
+            sudo kill -9 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null || true
+            sudo rm -f "$pidfile"
+        fi
+    done
 
-    # Define default network from packaged XML when available.
-    if ! run_virsh net-info default; then
-        for xml_candidate in /usr/share/libvirt/networks/default.xml /etc/libvirt/qemu/networks/default.xml; do
-            [[ -f "$xml_candidate" ]] || continue
-            run_virsh net-define "$xml_candidate" && break
-        done
-    fi
+    # Remove stale bridge interface
+    sudo ip link delete virbr0 2>/dev/null || true
+}
 
-    # Last resort: define a standard libvirt NAT network.
-    if ! run_virsh net-info default; then
-        tmp_xml="$(mktemp /tmp/nyx-default-net.XXXXXX.xml)"
-        cat >"$tmp_xml" <<'EOF'
+_define_default_network_xml() {
+    # Write a standard libvirt NAT network definition and define it
+    local tmp_xml
+    tmp_xml="$(mktemp /tmp/nyx-default-net.XXXXXX.xml)"
+    cat >"$tmp_xml" <<'EOF'
 <network>
   <name>default</name>
   <forward mode='nat'/>
@@ -104,13 +105,62 @@ ensure_default_network() {
   </ip>
 </network>
 EOF
-        run_virsh net-define "$tmp_xml" || true
-        rm -f "$tmp_xml"
+    sudo virsh net-define "$tmp_xml" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$tmp_xml"
+    return $rc
+}
+
+ensure_default_network() {
+    local err_out
+
+    # In modular mode, virtnetworkd must be running.
+    if $_NYX_USE_MODULAR; then
+        sudo systemctl start virtnetworkd.socket  >/dev/null 2>&1 || true
+        sudo systemctl start virtnetworkd.service >/dev/null 2>&1 || true
     fi
 
-    run_virsh net-start default || true
-    run_virsh net-autostart default || true
-    default_network_active
+    # ── Attempt 1: just try to start the existing network ────────────
+    # It may be defined+autostart but simply inactive after a daemon restart.
+    if sudo virsh net-start default >/dev/null 2>&1; then
+        sudo virsh net-autostart default >/dev/null 2>&1 || true
+        default_network_active && return 0
+    fi
+
+    # ── Attempt 2: full cleanup → redefine → start ───────────────────
+    _cleanup_stale_network
+
+    # Ensure the network is defined (don't undefine first — just
+    # define over it or define fresh if missing)
+    if ! sudo virsh net-info default >/dev/null 2>&1; then
+        _define_default_network_xml || true
+    fi
+
+    # Start and capture stderr so we can report the actual failure
+    err_out=$(sudo virsh net-start default 2>&1) || true
+    sudo virsh net-autostart default >/dev/null 2>&1 || true
+
+    if default_network_active; then
+        return 0
+    fi
+
+    # ── Attempt 3: nuclear — undefine, kill everything, redefine ─────
+    sudo virsh net-destroy default  >/dev/null 2>&1 || true
+    sudo virsh net-undefine default >/dev/null 2>&1 || true
+    _cleanup_stale_network
+
+    _define_default_network_xml || true
+
+    err_out=$(sudo virsh net-start default 2>&1) || true
+    sudo virsh net-autostart default >/dev/null 2>&1 || true
+
+    if default_network_active; then
+        return 0
+    fi
+
+    # Show the actual error from virsh so the user knows what's wrong
+    [[ -n "$err_out" ]] && log_error "virsh net-start default: $err_out"
+    return 1
 }
 
 # ── Prerequisite Checks ──
@@ -156,20 +206,21 @@ check_host_prerequisites() {
         exit 1
     fi
 
-    # libvirt daemons — start if needed (handles monolithic vs modular)
+    # libvirt daemons — only (re)start if virsh can't connect
     if ! _libvirt_daemon_active; then
         log_info "libvirt daemons not running, starting..."
-        _start_libvirt_daemons
-    else
-        # Even if a daemon is active, ensure sockets are clean
-        # (fixes leftover conflicts from earlier broken runs)
         _start_libvirt_daemons
     fi
 
     if ! _wait_for_virsh; then
-        log_error "libvirt daemons started but virsh cannot connect after 20 s."
-        log_info "Debug: systemctl status libvirtd virtqemud.socket virtnetworkd.socket"
-        exit 1
+        # virsh can't connect — sockets may be misconfigured; full restart
+        log_info "virsh cannot connect, restarting libvirt daemons..."
+        _start_libvirt_daemons
+        if ! _wait_for_virsh; then
+            log_error "libvirt daemons started but virsh cannot connect after 20 s."
+            log_info "Debug: systemctl status libvirtd virtqemud.socket virtnetworkd.socket"
+            exit 1
+        fi
     fi
 
     # User in libvirt group

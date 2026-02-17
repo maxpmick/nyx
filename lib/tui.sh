@@ -185,41 +185,44 @@ tui_spin() {
     _tui_detect
     local msg="$1"; shift
 
+    # "$@" may be a shell function (not an executable in PATH), so we
+    # can't hand it to gum spin directly.  Run it in a background
+    # subshell (which inherits function definitions and variables) and
+    # use the spinner just for visual feedback.
+    local logfile pid exit_code
+    logfile=$(mktemp)
+    "$@" >"$logfile" 2>&1 &
+    pid=$!
+
     case "$TUI_BACKEND" in
         gum)
-            gum spin --spinner dot --title "$msg" -- "$@"
+            gum spin --spinner dot --title "$msg" -- \
+                bash -c "while kill -0 $pid 2>/dev/null; do sleep 0.5; done" \
+                2>/dev/null || true
             ;;
         *)
-            local pid
-            printf "${CYAN}  ⠋ %s${RESET}" "$msg" >&2
-
-            # Run command in background, capture output for errors
-            local logfile
-            logfile=$(mktemp)
-            "$@" >"$logfile" 2>&1 &
-            pid=$!
-
             local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
             local i=0
+            printf "${CYAN}  ⠋ %s${RESET}" "$msg" >&2
             while kill -0 "$pid" 2>/dev/null; do
                 printf "\r${CYAN}  %s %s${RESET}" "${frames[$i]}" "$msg" >&2
                 i=$(( (i + 1) % ${#frames[@]} ))
                 sleep 0.1
             done
-
-            wait "$pid"
-            local exit_code=$?
-
-            if (( exit_code == 0 )); then
-                printf "\r${GREEN}  ✓ %s${RESET}\n" "$msg" >&2
-            else
-                printf "\r${RED}  ✗ %s${RESET}\n" "$msg" >&2
-                cat "$logfile" >&2
-            fi
-            rm -f "$logfile"
-            return $exit_code
             ;;
     esac
+
+    wait "$pid"
+    exit_code=$?
+
+    if (( exit_code == 0 )); then
+        printf "\r\033[K${GREEN}  ✓ %s${RESET}\n" "$msg" >&2
+    else
+        printf "\r\033[K${RED}  ✗ %s${RESET}\n" "$msg" >&2
+        cat "$logfile" >&2
+    fi
+    rm -f "$logfile"
+    return $exit_code
 }
 
 # ── tui_banner — show the Nyx banner ──
