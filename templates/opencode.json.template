@@ -10,13 +10,6 @@
       "model": "{{PROVIDER}}/{{MODEL}}"
     }
   },
-  "provider": {
-    "{{PROVIDER}}": {
-      "options": {
-        "apiKey": "{env:{{API_KEY_ENV_VAR}}}"
-      }
-    }
-  },
   "instructions": [{{INSTRUCTIONS}}],
   "permission": {
     "bash": "allow",

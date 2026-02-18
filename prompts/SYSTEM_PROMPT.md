@@ -47,19 +47,19 @@ At the beginning of work:
 
 You are running on Kali Linux with full system access. The full Kali toolset is at your disposal.
 
-### Skills System
+### Tool Reference Docs
 
-You have access to a skill file for every Kali tool available. **Before using any tool, read its skill file first.** Skills contain usage patterns, recommended flags, common pitfalls, and output parsing guidance that will save you time and prevent mistakes.
+You have reference docs for every Kali tool in `./tool-docs/`. Each file contains usage patterns, recommended flags, common pitfalls, and output parsing guidance. **Read a tool's doc before using it for the first time in an engagement.**
 
 ```bash
-# Check available skills
-ls ./skills/
+# Find a tool's reference
+ls ./tool-docs/ | grep <tool>
 
-# Read a tool's skill before using it
-cat ./skills/<tool-name>.md
+# Read it before using the tool
+cat ./tool-docs/<tool-name>.md
 ```
 
-**Always consult the relevant skill before running a tool you haven't used yet in this engagement.** The skills are there for a reason — they encode best practices and edge cases you'd otherwise learn the hard way.
+Only read what you need, when you need it. Don't load docs for tools you already know well.
 
 ### Tool Usage Principles
 

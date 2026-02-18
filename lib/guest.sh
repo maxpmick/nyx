@@ -12,7 +12,7 @@ WORKSPACE="/home/kali/pentest"
 ENABLE_EXA="true"
 CONFIG_FILE=""
 
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,10 +50,17 @@ done
 
 echo "[*] Starting guest provisioning..."
 
-# ── 1. Install Node.js/npm if not present ──
-if ! command -v node &>/dev/null; then
-    echo "[*] Installing Node.js..."
-    sudo apt-get update -qq
+# ── 1. Update system and install all Kali tools ──
+echo "[*] Updating system packages..."
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+echo "[*] Installing Kali tools..."
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kali-linux-default
+
+# ── 2. Install Node.js/npm if not present ──
+
+if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
+    echo "[*] Installing Node.js and npm..."
     sudo apt-get install -y -qq nodejs npm
 fi
 
@@ -63,16 +70,36 @@ if (( NODE_MAJOR < 20 )); then
     echo "[!] If nyx-memory install fails, upgrade Node.js to 20+ and rerun setup."
 fi
 
-# ── 2. Install OpenCode ──
+NPM_BIN=$(command -v npm 2>/dev/null || echo "/usr/bin/npm")
+
+# ── 3. Install OpenCode ──
 if ! command -v opencode &>/dev/null; then
     echo "[*] Installing OpenCode..."
     curl -fsSL https://opencode.ai/install | bash
+    hash -r
 fi
 
-# ── 3. Install nyx-memory ──
+# Store API key in OpenCode's auth.json (avoids env var namespace conflicts)
+echo "[*] Configuring OpenCode auth..."
+OPENCODE_AUTH_DIR="$HOME/.local/share/opencode"
+mkdir -p "$OPENCODE_AUTH_DIR"
+python3 -c "
+import json, os
+auth_file = os.path.join('$OPENCODE_AUTH_DIR', 'auth.json')
+auth = {}
+if os.path.isfile(auth_file):
+    with open(auth_file) as f:
+        auth = json.load(f)
+auth['$PROVIDER'] = {'type': 'api', 'key': '$API_KEY'}
+with open(auth_file, 'w') as f:
+    json.dump(auth, f, indent=2)
+"
+chmod 600 "$OPENCODE_AUTH_DIR/auth.json"
+
+# ── 4. Install nyx-memory ──
 if ! command -v nyx-memory &>/dev/null; then
     echo "[*] Installing nyx-memory..."
-    sudo npm install -g nyx-memory
+    sudo "$NPM_BIN" install -g nyx-memory
 fi
 
 if ! command -v nyx-log &>/dev/null; then
@@ -80,24 +107,22 @@ if ! command -v nyx-log &>/dev/null; then
     exit 1
 fi
 
-# ── 4. Create workspace structure ──
+# ── 5. Create workspace structure ──
 echo "[*] Creating workspace..."
 mkdir -p "$WORKSPACE"
-mkdir -p "$OPENCODE_DIR/skills"
-mkdir -p "$OPENCODE_DIR/commands"
+mkdir -p "$WORKSPACE/playbooks"
 mkdir -p "$WORKSPACE/engagements"
 
-# ── 5. Generate .env ──
+# ── 6. Generate .env ──
 echo "[*] Writing .env..."
 {
-    echo "# Nyx AI Configuration"
-    printf '%s=%q\n' "$API_KEY_ENV" "$API_KEY"
+    echo "# Nyx Configuration"
     printf 'NYX_DATA_DIR=%q\n' "${WORKSPACE}/engagements"
     printf 'OPENCODE_ENABLE_EXA=%q\n' "$ENABLE_EXA"
 } > "$WORKSPACE/.env"
 chmod 600 "$WORKSPACE/.env"
 
-# ── 6. Generate opencode.json from template ──
+# ── 7. Generate opencode.json from template ──
 echo "[*] Generating opencode.json..."
 
 # Build instructions list from prompt files
@@ -139,57 +164,65 @@ sed -i \
     -e "s|{{INSTRUCTIONS}}|${INSTRUCTIONS_ESC}|g" \
     "$WORKSPACE/opencode.json"
 
-# ── 7. Copy skills ──
+# ── 8. Copy tool reference docs ──
+TOOL_DOCS_DIR="$WORKSPACE/tool-docs"
 if [[ -d "$SETUP_DIR/skills" ]]; then
-    echo "[*] Deploying skills..."
-    # Skills may be individual .md files or directories containing .md files
+    echo "[*] Deploying tool reference docs..."
+    mkdir -p "$TOOL_DOCS_DIR"
+    count=0
     for item in "$SETUP_DIR/skills"/*; do
         [[ -e "$item" ]] || continue
         if [[ -d "$item" ]]; then
-            # Directory-based skill: look for .md files inside
-            local_name=$(basename "$item")
             for md in "$item"/*.md; do
                 [[ -f "$md" ]] || continue
-                cp "$md" "$OPENCODE_DIR/skills/${local_name}.md"
-                break  # Take first .md file
+                cp "$md" "$TOOL_DOCS_DIR/$(basename "$item").md"
+                count=$((count + 1))
+                break
             done
         elif [[ -f "$item" ]] && [[ "$item" == *.md ]]; then
-            cp "$item" "$OPENCODE_DIR/skills/"
+            cp "$item" "$TOOL_DOCS_DIR/"
+            count=$((count + 1))
         fi
     done
-    echo "[*] Deployed $(ls "$OPENCODE_DIR/skills/"*.md 2>/dev/null | wc -l) skills"
+    echo "[*] Deployed $count tool docs"
 fi
 
-# ── 8. Copy commands ──
+# ── 9. Copy playbooks ──
 if [[ -d "$SETUP_DIR/commands" ]]; then
     for f in "$SETUP_DIR/commands"/*.md; do
         [[ -f "$f" ]] || continue
-        cp "$f" "$OPENCODE_DIR/commands/"
+        cp "$f" "$WORKSPACE/playbooks/"
     done
 fi
 
-# ── 9. Source .env in .bashrc ──
-BASHRC="$HOME/.bashrc"
-MARKER="# nyx-env"
-if ! grep -q "$MARKER" "$BASHRC" 2>/dev/null; then
-    echo "[*] Adding .env to .bashrc..."
-    cat >> "$BASHRC" <<RCEOF
+# ── 10. Source .env in shell rc files ──
+NYX_RC_BLOCK="$(cat <<RCEOF
 
-$MARKER
+# nyx-env
 set -a
 source "$WORKSPACE/.env"
 set +a
-export PATH="\$HOME/.local/bin:\$PATH"
+export PATH="\$HOME/.local/bin:\$HOME/.opencode/bin:\$PATH"
 RCEOF
-fi
+)"
+MARKER="# nyx-env"
+for rcfile in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rcfile" ]] || continue
+    if ! grep -q "$MARKER" "$rcfile" 2>/dev/null; then
+        echo "[*] Adding .env to $(basename "$rcfile")..."
+        printf '%s\n' "$NYX_RC_BLOCK" >> "$rcfile"
+    fi
+done
 
-# ── 10. Verify ──
+# ── 11. Verify ──
 echo "[*] Verifying installation..."
 
 errors=0
 
 if ! command -v opencode &>/dev/null; then
-    if [[ -x "$HOME/.local/bin/opencode" ]]; then
+    if [[ -x "$HOME/.opencode/bin/opencode" ]]; then
+        echo "[*] opencode found at $HOME/.opencode/bin/opencode"
+    elif [[ -x "$HOME/.local/bin/opencode" ]]; then
         echo "[*] opencode found at $HOME/.local/bin/opencode"
     else
         echo "[!] opencode not found in PATH"
