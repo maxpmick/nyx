@@ -1,22 +1,5 @@
 <p align="center">
-  <pre align="center">
-                              
-                              
-$$$$$$$\  $$\   $$\ $$\   $$\ 
-$$  __$$\ $$ |  $$ |\$$\ $$  |
-$$ |  $$ |$$ |  $$ | \$$$$  / 
-$$ |  $$ |$$ |  $$ | $$  $$<  
-$$ |  $$ |\$$$$$$$ |$$  /\$$\ 
-\__|  \__| \____$$ |\__/  \__|
-          $$\   $$ |          
-          \$$$$$$  |          
-           \______/           
-
-
-  </pre>
-</p>
-
-<p align="center">
+  <strong>Nyx <br><br>
   <strong>Agentic pentester and OSINT machine.</strong><br>
   One command to build a Kali Linux VM with an AI-powered terminal agent.
 </p>
