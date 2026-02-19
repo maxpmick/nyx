@@ -1195,13 +1195,23 @@ def provision_existing_kali_vm(cfg):
     ok("Existing Kali VM provisioned")
 
 
-# ── 16. Install launcher ─────────────────────────────────────────────────────
+# ── 16. Install launchers ────────────────────────────────────────────────────
+
+def resolve_launcher_owner():
+    """Return the user/home that should own launcher files."""
+    if os.geteuid() == 0:
+        user = os.environ.get("SUDO_USER", "root")
+        home = os.path.expanduser(f"~{user}")
+    else:
+        user = getpass.getuser()
+        home = os.path.expanduser("~")
+    return user, home
+
 
 def install_launcher(cfg):
     info("Installing nyx launcher...")
 
-    real_user = os.environ.get("SUDO_USER", "root")
-    real_home = os.path.expanduser(f"~{real_user}")
+    real_user, real_home = resolve_launcher_owner()
     bin_dir = os.path.join(real_home, ".local", "bin")
     os.makedirs(bin_dir, exist_ok=True)
 
@@ -1255,11 +1265,63 @@ def install_launcher(cfg):
         f.write(launcher)
     os.chmod(launcher_path, 0o755)
 
-    # Fix ownership
-    if real_user != "root":
+    # Fix ownership when setup was run via sudo.
+    if os.geteuid() == 0 and real_user != "root":
         run_quiet(["chown", "-R", real_user, bin_dir])
 
     ok(f"Launcher installed: {launcher_path}")
+
+
+def install_guest_launcher(cfg):
+    """Install a local nyx launcher when setup.py is run inside Kali VM."""
+    info("Installing local nyx launcher...")
+
+    real_user, real_home = resolve_launcher_owner()
+    bin_dir = os.path.join(real_home, ".local", "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+
+    launcher_path = os.path.join(bin_dir, "nyx")
+    launcher = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        # nyx — Launch OpenCode in a local Nyx workspace
+        set -euo pipefail
+
+        WORKSPACE="{cfg['workspace']}"
+        export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$PATH"
+
+        if [[ ! -d "$WORKSPACE" ]]; then
+            printf "Nyx workspace not found: %s\\n" "$WORKSPACE" >&2
+            exit 1
+        fi
+
+        cd "$WORKSPACE"
+        if [[ -f ".env" ]]; then
+            set -a
+            source ".env"
+            set +a
+        fi
+
+        if command -v opencode >/dev/null 2>&1; then
+            exec opencode
+        fi
+
+        if [[ -x "$HOME/.opencode/bin/opencode" ]]; then
+            exec "$HOME/.opencode/bin/opencode"
+        fi
+
+        printf "opencode not found in PATH\\n" >&2
+        exit 1
+    """)
+
+    with open(launcher_path, "w") as f:
+        f.write(launcher)
+    os.chmod(launcher_path, 0o755)
+
+    if os.geteuid() == 0 and real_user != "root":
+        run_quiet(["chown", "-R", real_user, bin_dir])
+
+    ok(f"Local launcher installed: {launcher_path}")
+    return launcher_path
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1271,10 +1333,12 @@ def main():
         info("Detected existing Kali VM. Running guest-only setup path.")
         cfg = configure(guest_only=True)
         provision_existing_kali_vm(cfg)
+        install_guest_launcher(cfg)
         print()
         print(f"  {GREEN}{BOLD}Setup complete!{RESET}")
         print()
-        print(f"  Run {CYAN}cd {cfg['workspace']} && source .env && opencode{RESET}")
+        print(f"  Run {CYAN}nyx{RESET} to start.")
+        print(f"  If nyx is not found, add {CYAN}~/.local/bin{RESET} to your PATH.")
         print()
         return
 

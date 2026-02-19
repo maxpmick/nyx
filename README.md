@@ -53,7 +53,7 @@ The installer is interactive and handles everything:
    - Tool reference docs and playbooks deployed
 7. Host launcher installation at `~/.local/bin/nyx`
 
-When running `setup.py` inside an already-running Kali VM, setup auto-detects guest mode and only runs the OpenCode/Nyx customization flow.
+When running `setup.py` inside an already-running Kali VM, setup auto-detects guest mode, runs the OpenCode/Nyx customization flow, and installs a local launcher at `~/.local/bin/nyx`.
 
 Once complete:
 
