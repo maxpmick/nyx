@@ -85,6 +85,28 @@ apt_run() {
     return "$rc"
 }
 
+resolve_npm_cmd() {
+    if command -v npm &>/dev/null; then
+        NPM_CMD=(sudo "$(command -v npm)")
+        return 0
+    fi
+
+    local npm_cli=""
+    for candidate in /usr/bin/npm-cli.js /usr/share/nodejs/npm/bin/npm-cli.js; do
+        if [[ -f "$candidate" ]]; then
+            npm_cli="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$npm_cli" ]] && command -v node &>/dev/null; then
+        NPM_CMD=(sudo "$(command -v node)" "$npm_cli")
+        return 0
+    fi
+
+    return 1
+}
+
 echo "[*] Starting guest provisioning..."
 
 # ── 1. Update system and install all Kali tools ──
@@ -99,6 +121,12 @@ if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
     echo "[*] Installing Node.js and npm..."
     apt_run 1800 "Installing Node.js and npm" install -y nodejs npm
 fi
+hash -r
+
+if ! command -v node &>/dev/null; then
+    echo "[!] Node.js not found after installation attempt"
+    exit 1
+fi
 
 NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo "0")
 if (( NODE_MAJOR < 20 )); then
@@ -106,7 +134,12 @@ if (( NODE_MAJOR < 20 )); then
     echo "[!] If nyx-memory install fails, upgrade Node.js to 20+ and rerun setup."
 fi
 
-NPM_BIN=$(command -v npm 2>/dev/null || echo "/usr/bin/npm")
+declare -a NPM_CMD=()
+if ! resolve_npm_cmd; then
+    echo "[!] npm not found after installation attempt"
+    echo "[!] Install npm manually (apt-get install -y npm) and rerun setup"
+    exit 1
+fi
 
 # ── 3. Install OpenCode ──
 if ! command -v opencode &>/dev/null; then
@@ -135,7 +168,7 @@ chmod 600 "$OPENCODE_AUTH_DIR/auth.json"
 # ── 4. Install nyx-memory ──
 if ! command -v nyx-memory &>/dev/null; then
     echo "[*] Installing nyx-memory..."
-    sudo "$NPM_BIN" install -g nyx-memory
+    "${NPM_CMD[@]}" install -g nyx-memory
 fi
 
 if ! command -v nyx-log &>/dev/null; then
