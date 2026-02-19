@@ -49,20 +49,55 @@ for required in PROVIDER MODEL SMALL_MODEL API_KEY_ENV API_KEY WORKSPACE ENABLE_
     fi
 done
 
+apt_run() {
+    local timeout_secs="$1"
+    local description="$2"
+    shift 2
+    local attempt
+    local rc=0
+
+    for attempt in 1 2 3; do
+        echo "[*] ${description} (attempt ${attempt}/3)..."
+        if timeout "${timeout_secs}" sudo env DEBIAN_FRONTEND=noninteractive \
+            apt-get \
+            -o Dpkg::Lock::Timeout=300 \
+            -o Acquire::Retries=5 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o Acquire::ForceIPv4=true \
+            "$@"; then
+            return 0
+        fi
+
+        rc=$?
+        if [[ "$rc" -eq 124 ]]; then
+            echo "[!] ${description} timed out after ${timeout_secs}s"
+        else
+            echo "[!] ${description} failed with exit code ${rc}"
+        fi
+
+        if [[ "$attempt" -lt 3 ]]; then
+            echo "[*] Retrying in 5 seconds..."
+            sleep 5
+        fi
+    done
+
+    return "$rc"
+}
+
 echo "[*] Starting guest provisioning..."
 
 # ── 1. Update system and install all Kali tools ──
-echo "[*] Updating system packages..."
-sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+apt_run 900 "Updating system package lists" update
+apt_run 3600 "Upgrading installed packages" upgrade -y
 echo "[*] Installing Kali tools..."
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kali-linux-default
+apt_run 7200 "Installing kali-linux-default toolset" install -y kali-linux-default
 
 # ── 2. Install Node.js/npm if not present ──
 
 if ! command -v node &>/dev/null || ! command -v npm &>/dev/null; then
     echo "[*] Installing Node.js and npm..."
-    sudo apt-get install -y -qq nodejs npm
+    apt_run 1800 "Installing Node.js and npm" install -y nodejs npm
 fi
 
 NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo "0")
