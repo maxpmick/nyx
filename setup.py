@@ -1175,6 +1175,15 @@ def provision_existing_kali_vm(cfg):
         cmd = ["bash", guest_script, "--config-file", env_path, "--setup-dir", staging]
         real_user = os.environ.get("SUDO_USER", "")
         if os.geteuid() == 0 and real_user and real_user != "root":
+            # Existing Kali installs often require an interactive sudo password.
+            # If we drop privileges to the real user and they do not have
+            # passwordless sudo, guest.sh will fail non-interactively.
+            if not run_quiet(["sudo", "-n", "-u", real_user, "sudo", "-n", "true"]):
+                die(
+                    f"Existing Kali VM mode was launched via sudo, but user '{real_user}' does not have passwordless sudo.",
+                    "Run this mode as your normal user instead: python3 setup.py",
+                    f"Or grant passwordless sudo for '{real_user}' and retry.",
+                )
             run(["sudo", "-u", real_user, "-H"] + cmd)
         else:
             if os.geteuid() == 0:
