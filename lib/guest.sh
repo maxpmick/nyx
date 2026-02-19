@@ -85,6 +85,46 @@ apt_run() {
     return "$rc"
 }
 
+apt_lists_recent() {
+    local max_age_secs="$1"
+    local newest_ts now age
+
+    newest_ts=$(sudo bash -lc '
+stamp="/var/lib/apt/periodic/update-success-stamp"
+if [[ -f "$stamp" ]]; then
+    stat -c %Y "$stamp"
+    exit 0
+fi
+shopt -s nullglob
+newest=0
+for f in /var/lib/apt/lists/*InRelease /var/lib/apt/lists/*Release; do
+    ts=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if (( ts > newest )); then
+        newest=$ts
+    fi
+done
+echo "$newest"
+')
+
+    if [[ -z "$newest_ts" || "$newest_ts" -eq 0 ]]; then
+        return 1
+    fi
+
+    now=$(date +%s)
+    age=$((now - newest_ts))
+    (( age < max_age_secs ))
+}
+
+count_upgradable_packages() {
+    local count
+    count=$(sudo apt list --upgradable 2>/dev/null | tail -n +2 | sed '/^[[:space:]]*$/d' | wc -l)
+    count="${count//[[:space:]]/}"
+    if [[ -z "$count" || ! "$count" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    echo "$count"
+}
+
 resolve_npm_cmd() {
     if command -v npm &>/dev/null; then
         NPM_CMD=(sudo "$(command -v npm)")
@@ -110,8 +150,25 @@ resolve_npm_cmd() {
 echo "[*] Starting guest provisioning..."
 
 # ── 1. Update system and install all Kali tools ──
-apt_run 900 "Updating system package lists" update
-apt_run 3600 "Upgrading installed packages" upgrade -y
+APT_LIST_MAX_AGE_SECS=86400
+if apt_lists_recent "$APT_LIST_MAX_AGE_SECS"; then
+    echo "[*] Package lists are recent; skipping apt update"
+else
+    apt_run 900 "Updating system package lists" update
+fi
+
+if UPGRADABLE_COUNT=$(count_upgradable_packages); then
+    if (( UPGRADABLE_COUNT == 0 )); then
+        echo "[*] System packages already up to date; skipping apt upgrade"
+    else
+        echo "[*] ${UPGRADABLE_COUNT} package(s) can be upgraded"
+        apt_run 3600 "Upgrading installed packages" upgrade -y
+    fi
+else
+    echo "[!] Could not determine upgradable package count; running apt upgrade"
+    apt_run 3600 "Upgrading installed packages" upgrade -y
+fi
+
 echo "[*] Installing Kali tools..."
 apt_run 7200 "Installing kali-linux-default toolset" install -y kali-linux-default
 
