@@ -4,12 +4,14 @@
 import getpass
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
+import xml.etree.ElementTree as ET
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -64,9 +66,9 @@ PROVIDERS = {
 }
 
 PACKAGES = {
-    "arch": ["qemu-full", "libvirt", "dnsmasq", "virt-install", "guestfs-tools", "p7zip", "curl", "git", "gnupg"],
-    "debian": ["qemu-kvm", "libvirt-daemon-system", "dnsmasq-base", "virtinst", "libguestfs-tools", "p7zip-full", "curl", "git", "gpg"],
-    "fedora": ["qemu-kvm", "libvirt", "dnsmasq", "virt-install", "guestfs-tools", "p7zip", "curl", "git", "gnupg2"],
+    "arch": ["qemu-full", "libvirt", "dnsmasq", "virt-install", "guestfs-tools", "p7zip", "curl", "git", "gnupg", "usbutils"],
+    "debian": ["qemu-kvm", "libvirt-daemon-system", "dnsmasq-base", "virtinst", "libguestfs-tools", "p7zip-full", "curl", "git", "gpg", "usbutils"],
+    "fedora": ["qemu-kvm", "libvirt", "dnsmasq", "virt-install", "guestfs-tools", "p7zip", "curl", "git", "gnupg2", "usbutils"],
 }
 
 DEFAULT_NETWORK_XML = """\
@@ -170,6 +172,358 @@ def ssh_cmd(user, ip, key):
     ]
 
 
+# ── USB passthrough helpers ───────────────────────────────────────────────────
+
+def list_connected_usb_devices():
+    """Return connected USB devices, grouped by vendor/product ID."""
+    try:
+        result = subprocess.run(["lsusb"], capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        warn("lsusb not found; USB passthrough selection is unavailable.")
+        return []
+    except subprocess.CalledProcessError:
+        warn("Could not enumerate USB devices; USB passthrough selection is unavailable.")
+        return []
+
+    pattern = re.compile(
+        r"^Bus\s+\d+\s+Device\s+\d+:\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)$"
+    )
+    grouped = {}
+
+    for line in result.stdout.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+
+        vendor_id, product_id, description = match.groups()
+        key = (vendor_id.lower(), product_id.lower())
+        desc = description.strip() or "Unknown USB device"
+
+        if key not in grouped:
+            grouped[key] = {
+                "vendor_id": key[0],
+                "product_id": key[1],
+                "description": desc,
+                "count": 1,
+            }
+        else:
+            grouped[key]["count"] += 1
+            if grouped[key]["description"] == "Unknown USB device" and description.strip():
+                grouped[key]["description"] = description.strip()
+
+    return sorted(
+        grouped.values(),
+        key=lambda d: (d["vendor_id"], d["product_id"], d["description"]),
+    )
+
+
+def select_usb_passthrough_devices():
+    """Prompt user to choose USB devices for persistent passthrough."""
+    while True:
+        devices = list_connected_usb_devices()
+        if not devices:
+            print("  USB passthrough devices: none detected (or lsusb unavailable).")
+            raw = input("  Press 'r' to refresh, or Enter to skip: ").strip().lower()
+            print()
+            if raw == "r":
+                continue
+            return []
+
+        print("  USB passthrough devices (persistent):")
+        for i, dev in enumerate(devices, 1):
+            qty = f" x{dev['count']}" if dev["count"] > 1 else ""
+            print(f"    {i}) {dev['vendor_id']}:{dev['product_id']}  {dev['description']}{qty}")
+
+        raw = input("\n  Select USB device numbers (comma-separated), 'r' to refresh, Enter to skip: ").strip()
+        if not raw:
+            print()
+            return []
+        if raw.lower() == "r":
+            print()
+            continue
+
+        selected = []
+        seen = set()
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if not token.isdigit():
+                die(f"Invalid USB selection: {token}")
+
+            idx = int(token)
+            if idx < 1 or idx > len(devices):
+                die(f"Invalid USB selection index: {idx}")
+
+            dev = devices[idx - 1]
+            key = (dev["vendor_id"], dev["product_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append({
+                "vendor_id": dev["vendor_id"],
+                "product_id": dev["product_id"],
+                "description": dev["description"],
+            })
+
+        print()
+        return selected
+
+
+def usb_passthrough_exists(vm_xml, vendor_id, product_id):
+    """Check whether USB passthrough VID:PID already exists in domain XML."""
+    try:
+        root = ET.fromstring(vm_xml)
+    except ET.ParseError:
+        return False
+
+    want_vendor = f"0x{vendor_id.lower()}"
+    want_product = f"0x{product_id.lower()}"
+
+    for hostdev in root.findall("./devices/hostdev"):
+        if hostdev.get("type") != "usb":
+            continue
+
+        source = hostdev.find("source")
+        if source is None:
+            continue
+
+        vendor = source.find("vendor")
+        product = source.find("product")
+        if vendor is None or product is None:
+            continue
+
+        have_vendor = vendor.get("id", "").lower()
+        have_product = product.get("id", "").lower()
+        if have_vendor == want_vendor and have_product == want_product:
+            return True
+
+    return False
+
+
+def find_host_usb_devices(vendor_id, product_id):
+    """Return matching host USB device nodes for a VID:PID."""
+    sys_usb_root = "/sys/bus/usb/devices"
+    devices = []
+    if not os.path.isdir(sys_usb_root):
+        return devices
+
+    for entry in os.listdir(sys_usb_root):
+        # Top-level USB devices are names like 1-4, 3-7.1, etc.
+        # Interface entries include ":" and are handled separately.
+        if ":" in entry:
+            continue
+        dev_path = os.path.join(sys_usb_root, entry)
+        vendor_path = os.path.join(dev_path, "idVendor")
+        product_path = os.path.join(dev_path, "idProduct")
+        if not os.path.isfile(vendor_path) or not os.path.isfile(product_path):
+            continue
+        try:
+            with open(vendor_path) as f:
+                have_vendor = f.read().strip().lower()
+            with open(product_path) as f:
+                have_product = f.read().strip().lower()
+        except OSError:
+            continue
+        if have_vendor == vendor_id and have_product == product_id:
+            devices.append({"name": entry, "path": dev_path})
+
+    return sorted(devices, key=lambda d: d["name"])
+
+
+def install_usb_autosuspend_udev_rule(vendor_id, product_id):
+    """Persistently disable USB autosuspend for a passthrough VID:PID."""
+    rule_path = "/etc/udev/rules.d/99-nyx-usb-passthrough.rules"
+    rule = (
+        'ACTION=="add", SUBSYSTEM=="usb", '
+        f'ATTR{{idVendor}}=="{vendor_id}", ATTR{{idProduct}}=="{product_id}", '
+        'TEST=="power/control", ATTR{power/control}="on", '
+        'TEST=="power/autosuspend_delay_ms", ATTR{power/autosuspend_delay_ms}="-1"'
+    )
+
+    existing = ""
+    if os.path.isfile(rule_path):
+        try:
+            with open(rule_path) as f:
+                existing = f.read()
+        except OSError as e:
+            warn(f"Could not read {rule_path}: {e}")
+            return
+
+    if rule in existing:
+        return
+
+    try:
+        with open(rule_path, "a") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            if not existing:
+                f.write("# Managed by nyx setup.py for USB passthrough stability\n")
+            f.write(f"{rule}\n")
+        ok(f"Installed persistent USB autosuspend override for {vendor_id}:{product_id}")
+    except OSError as e:
+        warn(f"Failed to write {rule_path}: {e}")
+        return
+
+    run_quiet(["udevadm", "control", "--reload-rules"])
+    run_quiet([
+        "udevadm", "trigger",
+        "--subsystem-match=usb",
+        f"--attr-match=idVendor={vendor_id}",
+        f"--attr-match=idProduct={product_id}",
+    ])
+
+
+def disable_host_usb_autosuspend(vendor_id, product_id):
+    """Disable autosuspend immediately for matching host USB devices."""
+    devices = find_host_usb_devices(vendor_id, product_id)
+    if not devices:
+        warn(f"USB device not found on host for autosuspend tuning: {vendor_id}:{product_id}")
+        return
+
+    any_applied = False
+    for dev in devices:
+        device_applied = False
+        power_dir = os.path.join(dev["path"], "power")
+        control_path = os.path.join(power_dir, "control")
+        delay_path = os.path.join(power_dir, "autosuspend_delay_ms")
+
+        if os.path.isfile(control_path):
+            try:
+                with open(control_path, "w") as f:
+                    f.write("on")
+                device_applied = True
+            except OSError as e:
+                warn(f"Failed to set power/control for {dev['name']}: {e}")
+
+        if os.path.isfile(delay_path):
+            try:
+                with open(delay_path, "w") as f:
+                    f.write("-1")
+                device_applied = True
+            except OSError as e:
+                warn(f"Failed to set autosuspend_delay_ms for {dev['name']}: {e}")
+
+        if device_applied:
+            ok(f"Disabled USB autosuspend for {vendor_id}:{product_id} ({dev['name']})")
+            any_applied = True
+
+    if not any_applied:
+        info(f"No writable autosuspend controls found for {vendor_id}:{product_id}")
+
+
+def unbind_host_usb_drivers(vendor_id, product_id):
+    """Unbind host kernel drivers for matching USB VID:PID interfaces."""
+    sys_usb_root = "/sys/bus/usb/devices"
+    if not os.path.isdir(sys_usb_root):
+        warn("Cannot inspect /sys/bus/usb/devices; skipping host USB driver unbind.")
+        return
+
+    matches = [d["name"] for d in find_host_usb_devices(vendor_id, product_id)]
+
+    if not matches:
+        warn(f"USB device not found on host for driver unbind: {vendor_id}:{product_id}")
+        return
+
+    unbound_any = False
+    entries = sorted(os.listdir(sys_usb_root))
+    for device in matches:
+        iface_prefix = f"{device}:"
+        for iface in entries:
+            if not iface.startswith(iface_prefix):
+                continue
+
+            iface_path = os.path.join(sys_usb_root, iface)
+            driver_link = os.path.join(iface_path, "driver")
+            if not os.path.islink(driver_link):
+                continue
+
+            driver_name = os.path.basename(os.path.realpath(driver_link))
+            unbind_path = os.path.join(driver_link, "unbind")
+            try:
+                with open(unbind_path, "w") as f:
+                    f.write(iface)
+                ok(f"Unbound host driver {driver_name} from {vendor_id}:{product_id} ({iface})")
+                unbound_any = True
+            except OSError as e:
+                warn(f"Failed to unbind host driver for {vendor_id}:{product_id} ({iface}): {e}")
+
+    if not unbound_any:
+        info(f"No host USB interface drivers needed unbinding for {vendor_id}:{product_id}")
+
+
+def apply_usb_passthrough(cfg):
+    """Attach selected USB devices to VM persistently."""
+    devices = cfg.get("usb_passthrough", [])
+    if not devices:
+        return
+
+    vm_name = cfg["vm_name"]
+    if not virsh("dominfo", vm_name):
+        warn(f"Cannot configure USB passthrough: VM '{vm_name}' not found.")
+        return
+
+    info("Applying persistent USB passthrough configuration...")
+    vm_xml = virsh_output("dumpxml", vm_name)
+    if not vm_xml:
+        warn("Could not read VM XML; skipping USB passthrough.")
+        return
+    vm_running = virsh_output("domstate", vm_name).strip().lower() == "running"
+
+    for dev in devices:
+        vendor_id = dev["vendor_id"].lower()
+        product_id = dev["product_id"].lower()
+        label = dev.get("description", "USB device")
+        install_usb_autosuspend_udev_rule(vendor_id, product_id)
+        disable_host_usb_autosuspend(vendor_id, product_id)
+        unbind_host_usb_drivers(vendor_id, product_id)
+
+        hostdev_xml = textwrap.dedent(f"""\
+            <hostdev mode='subsystem' type='usb' managed='yes'>
+              <source>
+                <vendor id='0x{vendor_id}'/>
+                <product id='0x{product_id}'/>
+              </source>
+            </hostdev>
+        """)
+
+        if usb_passthrough_exists(vm_xml, vendor_id, product_id):
+            ok(f"USB passthrough already configured: {vendor_id}:{product_id} ({label})")
+            if vm_running:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+                    f.write(hostdev_xml)
+                    temp_xml = f.name
+                try:
+                    # Reset stale runtime state first, then reattach live.
+                    detach_cmd = ["virsh", "-c", "qemu:///system", "detach-device", vm_name, temp_xml, "--live"]
+                    run_quiet(detach_cmd) or run_quiet(["sudo"] + detach_cmd)
+
+                    attach_cmd = ["virsh", "-c", "qemu:///system", "attach-device", vm_name, temp_xml, "--live"]
+                    if run_quiet(attach_cmd) or run_quiet(["sudo"] + attach_cmd):
+                        ok(f"USB passthrough live reset applied: {vendor_id}:{product_id} ({label})")
+                    else:
+                        warn(f"USB passthrough live reset failed: {vendor_id}:{product_id} ({label})")
+                finally:
+                    os.unlink(temp_xml)
+            continue
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(hostdev_xml)
+            temp_xml = f.name
+
+        try:
+            cmd = ["virsh", "-c", "qemu:///system", "attach-device", vm_name, temp_xml, "--config"]
+            if vm_running:
+                cmd.append("--live")
+            if run_quiet(cmd) or run_quiet(["sudo"] + cmd):
+                ok(f"USB passthrough configured: {vendor_id}:{product_id} ({label})")
+                vm_xml = virsh_output("dumpxml", vm_name)
+            else:
+                warn(f"Failed to configure USB passthrough: {vendor_id}:{product_id} ({label})")
+        finally:
+            os.unlink(temp_xml)
+
+
 # ── 1. Banner ─────────────────────────────────────────────────────────────────
 
 def print_banner():
@@ -212,12 +566,41 @@ def check_prerequisites():
 
 # ── 3. Detect distro ─────────────────────────────────────────────────────────
 
-def detect_distro():
-    info("Detecting distribution...")
+def read_os_release():
+    """Read /etc/os-release as lowercase text, or return empty string."""
     try:
         with open("/etc/os-release") as f:
-            os_release = f.read().lower()
+            return f.read().lower()
     except FileNotFoundError:
+        return ""
+
+
+def is_running_inside_kali_vm():
+    """Return True if this script is running inside a Kali virtual machine."""
+    os_release = read_os_release()
+    if "kali" not in os_release:
+        return False
+
+    if run_quiet(["systemd-detect-virt", "--vm", "--quiet"]):
+        return True
+
+    vm_markers = ("kvm", "qemu", "vmware", "virtualbox", "xen", "hyper-v", "parallels")
+    for path in ["/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"]:
+        try:
+            with open(path) as f:
+                data = f.read().strip().lower()
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if any(marker in data for marker in vm_markers):
+            return True
+
+    return False
+
+
+def detect_distro():
+    info("Detecting distribution...")
+    os_release = read_os_release()
+    if not os_release:
         die("Cannot detect distribution: /etc/os-release not found.")
 
     if "arch" in os_release:
@@ -362,9 +745,10 @@ def ensure_default_network():
 
 # ── 7. Interactive config ─────────────────────────────────────────────────────
 
-def configure():
+def configure(guest_only=False):
     print()
-    print(f"  {BOLD}Configuration{RESET}")
+    title = "Configuration (Kali guest mode)" if guest_only else "Configuration"
+    print(f"  {BOLD}{title}{RESET}")
     print()
 
     # Provider
@@ -403,6 +787,28 @@ def configure():
         die("API key is required.")
     print()
 
+    workspace = input("  Workspace [/home/kali/pentest]: ").strip() or "/home/kali/pentest"
+    print()
+
+    # Web search
+    exa_input = input("  Enable Exa web search? [Y/n]: ").strip().lower()
+    enable_exa = exa_input != "n"
+    print()
+
+    base_cfg = {
+        "provider": provider["id"],
+        "provider_name": provider["name"],
+        "env_var": provider["env"],
+        "model": model,
+        "small_model": small_model,
+        "api_key": api_key,
+        "workspace": workspace,
+        "enable_exa": "true" if enable_exa else "false",
+    }
+
+    if guest_only:
+        return base_cfg
+
     # VM resources
     vm_name = input("  VM name [nyx-kali]: ").strip() or "nyx-kali"
 
@@ -419,24 +825,15 @@ def configure():
         die(f"Invalid CPU value: {cpus_input}")
     print()
 
-    # Web search
-    exa_input = input("  Enable Exa web search? [Y/n]: ").strip().lower()
-    enable_exa = exa_input != "n"
-    print()
+    usb_passthrough = select_usb_passthrough_devices()
 
     return {
-        "provider": provider["id"],
-        "provider_name": provider["name"],
-        "env_var": provider["env"],
-        "model": model,
-        "small_model": small_model,
-        "api_key": api_key,
+        **base_cfg,
         "vm_name": vm_name,
         "vm_ram": vm_ram,
         "vm_cpus": vm_cpus,
         "vm_user": "kali",
-        "workspace": "/home/kali/pentest",
-        "enable_exa": "true" if enable_exa else "false",
+        "usb_passthrough": usb_passthrough,
         "ssh_key": os.path.join(
             os.path.expanduser(f"~{os.environ.get('SUDO_USER', 'root')}"),
             ".ssh", "nyx_kali"
@@ -662,18 +1059,77 @@ def wait_for_vm(cfg):
     if state != "running":
         virsh("start", vm_name)
 
-    # Poll for SSH (up to 90s)
-    ssh_base = ssh_cmd(cfg["vm_user"], vm_ip, cfg["ssh_key"])
-    for i in range(45):
-        if run_quiet(ssh_base + ["true"]):
+    # Poll for SSH (up to 5 minutes), with a live timer.
+    timeout_seconds = 300
+    poll_interval = 2
+    start_time = time.monotonic()
+    timer_printed = False
+
+    ssh_probe = ssh_cmd(cfg["vm_user"], vm_ip, cfg["ssh_key"])
+    for i, token in enumerate(ssh_probe):
+        if token == "ConnectTimeout=10":
+            ssh_probe[i] = "ConnectTimeout=2"
+            break
+
+    while True:
+        if run_quiet(ssh_probe + ["true"]):
+            if timer_printed:
+                print()
             ok(f"VM ready at {vm_ip}")
             return vm_ip
-        time.sleep(2)
 
-    die(f"SSH not reachable at {vm_ip} after 90s.")
+        elapsed = int(time.monotonic() - start_time)
+        if elapsed >= timeout_seconds:
+            if timer_printed:
+                print()
+            die(f"SSH not reachable at {vm_ip} after {timeout_seconds} seconds.")
+
+        remaining = timeout_seconds - elapsed
+        elapsed_m, elapsed_s = divmod(elapsed, 60)
+        remaining_m, remaining_s = divmod(remaining, 60)
+        max_m, max_s = divmod(timeout_seconds, 60)
+        print(
+            f"\r  SSH wait timer: {elapsed_m:02d}:{elapsed_s:02d} elapsed, "
+            f"{remaining_m:02d}:{remaining_s:02d} remaining (max {max_m:02d}:{max_s:02d})",
+            end="",
+            flush=True,
+        )
+        timer_printed = True
+        time.sleep(min(poll_interval, remaining))
 
 
 # ── 14. Provision VM ─────────────────────────────────────────────────────────
+
+def build_guest_staging_bundle(cfg):
+    """Create temp staging directory with guest provisioning payload."""
+    staging = tempfile.mkdtemp(prefix="nyx-setup-")
+
+    shutil.copytree(os.path.join(SCRIPT_DIR, "lib"), os.path.join(staging, "lib"))
+    shutil.copytree(os.path.join(SCRIPT_DIR, "templates"), os.path.join(staging, "templates"))
+
+    for d in ["prompts", "skills", "commands"]:
+        src = os.path.join(SCRIPT_DIR, d)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(staging, d))
+
+    # Single-quote values to prevent shell interpretation.
+    env_path = os.path.join(staging, "nyx-setup.env")
+    with open(env_path, "w") as f:
+        for key, val in [
+            ("PROVIDER", cfg["provider"]),
+            ("MODEL", cfg["model"]),
+            ("SMALL_MODEL", cfg["small_model"]),
+            ("API_KEY_ENV", cfg["env_var"]),
+            ("API_KEY", cfg["api_key"]),
+            ("WORKSPACE", cfg["workspace"]),
+            ("ENABLE_EXA", cfg["enable_exa"]),
+        ]:
+            safe_val = val.replace("'", "'\\''")
+            f.write(f"{key}='{safe_val}'\n")
+    os.chmod(env_path, 0o600)
+
+    return staging
+
 
 def provision_vm(cfg, vm_ip):
     info("Provisioning VM...")
@@ -690,37 +1146,10 @@ def provision_vm(cfg, vm_ip):
     ]
     target = f"{cfg['vm_user']}@{vm_ip}"
 
-    # Build staging directory
-    staging = tempfile.mkdtemp()
+    staging = build_guest_staging_bundle(cfg)
     try:
-        # Copy lib/ (guest.sh lives here)
-        shutil.copytree(os.path.join(SCRIPT_DIR, "lib"), os.path.join(staging, "lib"))
-        # Copy templates/
-        shutil.copytree(os.path.join(SCRIPT_DIR, "templates"), os.path.join(staging, "templates"))
-        # Copy optional dirs
-        for d in ["prompts", "skills", "commands"]:
-            src = os.path.join(SCRIPT_DIR, d)
-            if os.path.isdir(src):
-                shutil.copytree(src, os.path.join(staging, d))
-
-        # Write config env file (single-quote values to prevent shell interpretation)
-        env_path = os.path.join(staging, "nyx-setup.env")
-        with open(env_path, "w") as f:
-            for key, val in [
-                ("PROVIDER", cfg["provider"]),
-                ("MODEL", cfg["model"]),
-                ("SMALL_MODEL", cfg["small_model"]),
-                ("API_KEY_ENV", cfg["env_var"]),
-                ("API_KEY", cfg["api_key"]),
-                ("WORKSPACE", cfg["workspace"]),
-                ("ENABLE_EXA", cfg["enable_exa"]),
-            ]:
-                safe_val = val.replace("'", "'\\''")
-                f.write(f"{key}='{safe_val}'\n")
-        os.chmod(env_path, 0o600)
-
         # Upload to VM
-        run(ssh_base + ["mkdir -p /tmp/nyx-setup"])
+        run(ssh_base + ["rm -rf /tmp/nyx-setup && mkdir -p /tmp/nyx-setup"])
         run(scp_base + [f"{staging}/.", f"{target}:/tmp/nyx-setup/"])
         run(ssh_base + ["chmod 700 /tmp/nyx-setup && chmod 600 /tmp/nyx-setup/nyx-setup.env"])
 
@@ -732,7 +1161,32 @@ def provision_vm(cfg, vm_ip):
     ok("VM provisioned")
 
 
-# ── 15. Install launcher ─────────────────────────────────────────────────────
+# ── 15. Provision existing Kali VM ───────────────────────────────────────────
+
+def provision_existing_kali_vm(cfg):
+    """Run guest provisioning locally when setup.py executes inside a Kali VM."""
+    info("Provisioning existing Kali VM (OpenCode + Nyx customizations)...")
+
+    staging = build_guest_staging_bundle(cfg)
+    guest_script = os.path.join(staging, "lib", "guest.sh")
+    env_path = os.path.join(staging, "nyx-setup.env")
+
+    try:
+        cmd = ["bash", guest_script, "--config-file", env_path, "--setup-dir", staging]
+        real_user = os.environ.get("SUDO_USER", "")
+        if os.geteuid() == 0 and real_user and real_user != "root":
+            run(["sudo", "-u", real_user, "-H"] + cmd)
+        else:
+            if os.geteuid() == 0:
+                warn("Running guest setup as root; OpenCode files will be written under /root.")
+            run(cmd)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    ok("Existing Kali VM provisioned")
+
+
+# ── 16. Install launcher ─────────────────────────────────────────────────────
 
 def install_launcher(cfg):
     info("Installing nyx launcher...")
@@ -803,6 +1257,18 @@ def install_launcher(cfg):
 
 def main():
     print_banner()
+
+    if is_running_inside_kali_vm():
+        info("Detected existing Kali VM. Running guest-only setup path.")
+        cfg = configure(guest_only=True)
+        provision_existing_kali_vm(cfg)
+        print()
+        print(f"  {GREEN}{BOLD}Setup complete!{RESET}")
+        print()
+        print(f"  Run {CYAN}cd {cfg['workspace']} && source .env && opencode{RESET}")
+        print()
+        return
+
     check_prerequisites()
     distro = detect_distro()
     install_packages(distro)
@@ -816,6 +1282,7 @@ def main():
     extract_image(cfg)
     customize_image(cfg)
     create_vm(cfg)
+    apply_usb_passthrough(cfg)
     vm_ip = wait_for_vm(cfg)
     provision_vm(cfg, vm_ip)
     install_launcher(cfg)

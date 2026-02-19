@@ -21,6 +21,7 @@
 - Installs [nyx-memory](https://github.com/maxpmick/nyx-memory) for structured pentest documentation
 - Deploys 790+ tool reference docs and workflow playbooks into the VM
 - Installs a `nyx` launcher on the host that starts the VM and connects
+- If run inside an existing Kali VM, it skips host/libvirt provisioning and applies OpenCode + Nyx customizations only
 
 ## Prerequisites
 
@@ -43,13 +44,16 @@ The installer is interactive and handles everything:
 1. Host package installation (qemu, libvirt, etc.)
 2. libvirt network setup + iptables rules for hosts running UFW/Tailscale/Docker
 3. Kali QEMU image download (~3.5 GB) with checksum verification
-4. Image customization — SSH key injection, static IP (`192.168.122.50`), DNS
-5. VM creation and guest provisioning:
+4. Interactive config (provider/model/API key, VM sizing, optional persistent USB passthrough)
+5. Image customization — SSH key injection, static IP (`192.168.122.50`), DNS
+6. VM creation and guest provisioning:
    - Full system update + `kali-linux-default` toolset
    - OpenCode + nyx-memory installed
    - API key stored in OpenCode's auth store
    - Tool reference docs and playbooks deployed
-6. Host launcher installation at `~/.local/bin/nyx`
+7. Host launcher installation at `~/.local/bin/nyx`
+
+When running `setup.py` inside an already-running Kali VM, setup auto-detects guest mode and only runs the OpenCode/Nyx customization flow.
 
 Once complete:
 
@@ -106,18 +110,18 @@ Pre-install dependencies before running setup:
 
 **Arch Linux**
 ```bash
-sudo pacman -S --needed qemu-full libvirt dnsmasq virt-install guestfs-tools p7zip curl git gnupg
+sudo pacman -S --needed qemu-full libvirt dnsmasq virt-install guestfs-tools p7zip curl git gnupg usbutils
 ```
 
 **Debian / Ubuntu**
 ```bash
 sudo apt-get update && sudo apt-get install -y qemu-kvm libvirt-daemon-system \
-  libvirt-daemon-config-network dnsmasq-base virtinst libguestfs-tools p7zip-full curl git gpg
+  libvirt-daemon-config-network dnsmasq-base virtinst libguestfs-tools p7zip-full curl git gpg usbutils
 ```
 
 **Fedora**
 ```bash
-sudo dnf install -y qemu-kvm libvirt dnsmasq virt-install guestfs-tools p7zip curl git gnupg2
+sudo dnf install -y qemu-kvm libvirt dnsmasq virt-install guestfs-tools p7zip curl git gnupg2 usbutils
 ```
 
 ## Troubleshooting
